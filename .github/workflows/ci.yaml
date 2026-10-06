@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses sources
+
+  nandsim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The azure runner kernel has no MTD support at all, so the harness runs inside a VM
+      # booted from Ubuntu's generic kernel (which ships nandsim, ubi and ubifs as modules).
+      - name: Install generic kernel, MTD tools and virtme-ng
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mtd-utils erofs-utils qemu-system-x86 python3-pip busybox-static
+          gk=$(apt-cache depends linux-image-generic | awk '/Depends: linux-image-[0-9]/{print $2}' | head -1)
+          kv=${gk#linux-image-}
+          if [ -z "$kv" ] || ! apt-cache show "linux-modules-extra-$kv" >/dev/null 2>&1; then
+            echo "::error::cannot resolve the generic kernel or its linux-modules-extra package"
+            exit 1
+          fi
+          echo "GENERIC_KERNEL=$kv" >> "$GITHUB_ENV"
+          sudo apt-get install -y "linux-image-$kv" "linux-modules-$kv" "linux-modules-extra-$kv"
+          sudo pip install --break-system-packages virtme-ng
+          vng --version
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - run: cargo build --release --bin install_on_mtd
+      - name: Run nandsim harness in a generic-kernel VM
+        run: |
+          set -o pipefail
+          sudo "$(command -v vng)" --run "/boot/vmlinuz-$GENERIC_KERNEL" --user root --rw --memory 2G \
+            --exec "uname -r && modprobe nandsim && rmmod nandsim && cd '$GITHUB_WORKSPACE' && tests/nandsim.sh target/release/install_on_mtd"
+
+  armv7:
+    # Buildroot target of the Turing Pi 2 BMC: soft-float armv7 glibc (see .cargo/config).
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
+      # Same as .cargo/config plus relocation-model=static: Ubuntu's armel cross
+      # libc ships no rcrt1.o, so crt-static must not link as static-pie.
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_RUSTFLAGS: >-
+        -C lto=yes -C embed-bitcode=yes -C opt-level=z
+        -C target-feature=+crt-static -C relocation-model=static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: armv7-unknown-linux-gnueabi
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabi
+      - run: cargo build --release --target armv7-unknown-linux-gnueabi --bin sdcard --bin sdcard_userspace
