@@ -72,9 +72,18 @@ jobs:
       - run: cargo build --release --bin install_on_mtd
       - name: Run nandsim harness in a generic-kernel VM
         run: |
+          # pipefail: a non-zero exit from vng (the guest's exit code) fails the step even
+          # though the output goes through tee.
           set -o pipefail
+          log="$RUNNER_TEMP/nandsim-vng.log"
           sudo "$(command -v vng)" --run "/boot/vmlinuz-$GENERIC_KERNEL" --user root --rw --memory 2G \
-            --exec "uname -r && modprobe nandsim && rmmod nandsim && cd '$GITHUB_WORKSPACE' && tests/nandsim.sh target/release/install_on_mtd"
+            --exec "uname -r && modprobe nandsim && rmmod nandsim && cd '$GITHUB_WORKSPACE' && tests/nandsim.sh target/release/install_on_mtd" \
+            2>&1 | tee "$log"
+          # Do not trust the exit code alone: the harness must also have printed its success marker.
+          if ! grep -qx 'all cases passed' "$log"; then
+            echo "::error::tests/nandsim.sh did not print 'all cases passed'"
+            exit 1
+          fi
 
   armv7:
     # Buildroot target of the Turing Pi 2 BMC: soft-float armv7 glibc (see .cargo/config).
