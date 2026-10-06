@@ -36,8 +36,8 @@ MTD=""
 log() { printf '    %s\n' "$*"; }
 die() { printf '    ASSERT: %s\n' "$*" >&2; return 1; }
 
-now() { date +%s.%N; }
-elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", b - a }'; }
+now() { echo "$EPOCHREALTIME"; }
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
 
 # wait_for <seconds> <description> <command...>: poll a command, bounded.
 wait_for() {
@@ -237,6 +237,7 @@ install() {
     t1=$(now)
     INSTALL_SECS=$(elapsed "$t0" "$t1")
     sed 's/^/        | /' "$WORK/out"
+    grep -E '^(decision|reason|detail):' "$WORK/out" | sed 's/^/    binary says: /'
     [ "$rc" -eq 0 ] || die "install_on_mtd exited with $rc"
     grep -qx 'done' "$WORK/out" || die "install_on_mtd did not print 'done'"
     log "install_on_mtd took ${INSTALL_SECS}s"
@@ -327,15 +328,18 @@ case_keep() {
     decision_is kept
     echo "$INSTALL_SECS" >"$WORK/time.keep"
     verify_kept "$ROOTFS_B" 2
-    touch "$WORK/case-keep.ok"
 }
 
 case_second_install() {
-    [ -e "$WORK/case-keep.ok" ] || die "needs case 'keep' to have passed"
+    build_board std
     dmesg -C 2>/dev/null || true
-    install "$ROOTFS_C"
+    install "$ROOTFS_B"
     decision_is kept
-    verify_kept "$ROOTFS_C" 2
+    verify_kept "$ROOTFS_B" 2 # also writes a file into the overlay and refreshes the manifest
+    dmesg -C 2>/dev/null || true
+    install "$ROOTFS_C" # on the same nandsim, no teardown
+    decision_is kept
+    verify_kept "$ROOTFS_C" 2 # includes the file written after the first install
 }
 
 case_factory_reset() {
