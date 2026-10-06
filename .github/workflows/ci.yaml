@@ -58,9 +58,16 @@ jobs:
       - name: TEMP modprobe probe
         run: |
           uname -r
-          sudo modprobe nandsim first_id_byte=0x20 second_id_byte=0xaa third_id_byte=0x00 fourth_id_byte=0x15
+          grep -E "NANDSIM|MTD_NAND|MTD_RAM|BLOCK2MTD|MTD_MTDRAM|MTD=|MTD_UBI|EROFS_FS|SQUASHFS=" /boot/config-$(uname -r) || true
+          find /lib/modules/$(uname -r) -path '*mtd*' | head -50
+          find /lib/modules/$(uname -r) -name 'nandsim*' -o -name 'mtdram*' -o -name 'block2mtd*' -o -name 'ubi*' | head
+          dpkg -L "linux-modules-extra-$(uname -r)" | grep -i -E "mtd|nand|ubi" | head -30
+          apt-cache search linux-modules | grep -i azure | head
+          sudo modprobe mtdram total_size=1024 || true
+          sudo modprobe block2mtd || true
+          sudo modprobe ubi || true
+          lsmod | grep -E "mtd|ubi|nand" || true
           cat /proc/mtd
-          sudo rmmod nandsim
       - run: cargo build --release --bin install_on_mtd
       - run: sudo tests/nandsim.sh target/release/install_on_mtd
 
@@ -69,6 +76,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
+      # Same as .cargo/config plus relocation-model=static: Ubuntu's armel cross
+      # libc ships no rcrt1.o, so crt-static must not link as static-pie.
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_RUSTFLAGS: >-
+        -C lto=yes -C embed-bitcode=yes -C opt-level=z
+        -C target-feature=+crt-static -C relocation-model=static
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable

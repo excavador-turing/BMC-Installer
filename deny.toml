@@ -1,5 +1,6 @@
+# cargo-deny 0.18+ removed the `unlicensed`, `copyleft`, `allow-osi-fsf-free`,
+# `default` and `deny` license keys: anything not in `allow` is now denied.
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -8,12 +9,6 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
 ]
-deny = [
-    "Nokia",
-]
-copyleft = "deny"
-allow-osi-fsf-free = "neither"
-default = "deny"
 confidence-threshold = 0.8
 
 [[licenses.clarify]]
@@ -23,4 +18,3 @@ expression = "MIT AND ISC AND OpenSSL"
 license-files = [
     { path = "LICENSE", hash = 0xbd0eed23 }
 ]
-
