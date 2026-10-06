@@ -32,11 +32,17 @@
 //! is how we detect that the migration is necessary. Rather than merely erase everything, try
 //! to preserve ECs (per UBI docs), and copy the even-block EC values to the odd blocks as well.
 
+//!
+//! Reimaging can also keep one existing volume (the firmware's settings) bit-for-bit; see the
+//! [preserve] module for when that is safe.
+
 mod format;
 mod headers;
+pub mod preserve;
 mod scan;
 pub mod ubinize;
 
-pub use format::{format, write_volumes};
-pub use headers::VolType;
-pub use scan::{scan_blocks, Ebt};
+pub use format::{format, leb_size, write_volumes};
+pub use headers::{Ec, Vid, VolTableRecord, VolType, VtblSlot};
+pub use preserve::{check_capacity, find_preserved_volume, Preserved, Refusal};
+pub use scan::{scan_blocks, BlockContent, Ebt};

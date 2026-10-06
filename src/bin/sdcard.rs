@@ -9,7 +9,11 @@
 //!    subprocesses to do any of the work. This binary needs to be self-contained.
 //! 4. The filesystem starts empty. Essential mountpoints like `/proc` and `/sys` need to be
 //!    established before any meaningful work can be done.
-use bmc_installer::turing_pi::{led, read_from_sdcard, setup_initramfs, upgrade_bmc, wait_forever};
+use bmc_installer::install::SettingsPlan;
+use bmc_installer::turing_pi::{
+    install_mode_from_cmdline, led, read_from_sdcard, setup_initramfs, upgrade_bmc, wait_forever,
+    Confirmation,
+};
 use std::{
     io,
     sync::{self, atomic},
@@ -17,13 +21,23 @@ use std::{
     time::Duration,
 };
 
-const INSTRUCTIONS: &str = "\
+const INTRO: &str = "\
 This utility will perform a fresh installation of the Turing Pi 2 BMC firmware.
+";
 
-Note that this will ERASE ALL USER DATA stored on the Turing Pi 2 BMC, thus
-restoring back to factory defaults. Do NOT proceed unless you have first backed
-up any files that you care about!
+const SETTINGS_KEPT: &str = "\
+Settings stored on this board (root password, TLS certificate, network and node
+settings) will be KEPT. To erase them instead and restore factory defaults, type
+'ERASE' at the below prompt.
+";
 
+const SETTINGS_ERASED: &str = "\
+This will ERASE ALL USER DATA stored on the Turing Pi 2 BMC, thus restoring
+back to factory defaults. Do NOT proceed unless you have first backed up any
+files that you care about!
+";
+
+const HOW_TO_CONFIRM: &str = "\
 If you wish to confirm the operation and proceed, either:
 1) Type 'CONFIRM' at the below prompt
 2) Press one of the front panel buttons (POWER or RESET), or the KEY1 button on
@@ -33,20 +47,33 @@ If you are here in error, please remove the microSD card from the Turing Pi 2
 board and reset the BMC.
 ";
 
+/// The text shown before the prompt, saying truthfully what is about to happen to the settings.
+fn instructions(plan: &SettingsPlan) -> String {
+    let settings = match plan {
+        SettingsPlan::Keep(_) => SETTINGS_KEPT.to_string(),
+        SettingsPlan::Reset => format!("A factory reset was requested.\n\n{SETTINGS_ERASED}"),
+        SettingsPlan::CannotKeep(reason) => {
+            format!("Settings cannot be kept: {reason}.\n\n{SETTINGS_ERASED}")
+        }
+    };
+    format!("{INTRO}\n{settings}\n{HOW_TO_CONFIRM}")
+}
+
 const KEYS_EVDEV_PATH: &str = "/dev/input/event0";
 
 /// Wait until the user confirms the installation operation, through either the serial prompt or
-/// by pressing a GPIO key multiple times.
+/// by pressing a GPIO key multiple times. Typing `ERASE` instead asks for a factory reset; the
+/// keys can only confirm what the prompt said.
 ///
 /// This spawns one thread each, for both methods.
-fn wait_for_confirmation() {
+fn wait_for_confirmation(offer_erase: bool) -> Confirmation {
     let signals = sync::Arc::new((atomic::AtomicBool::new(false), thread::current()));
     let signals_1 = signals.clone();
     let signals_2 = signals.clone();
     let mut threads = [
         Some(thread::spawn(move || {
             let (stop_flag, main_thread) = &*signals_1;
-            let ret = confirm_prompt(stop_flag);
+            let ret = confirm_prompt(stop_flag, offer_erase);
             main_thread.unpark();
             ret
         })),
@@ -62,15 +89,15 @@ fn wait_for_confirmation() {
 
     loop {
         for thread in &mut threads {
-            if thread.as_ref().map_or(false, |thread| thread.is_finished()) {
+            if thread.as_ref().is_some_and(|thread| thread.is_finished()) {
                 let ret = thread
                     .take()
                     .unwrap()
                     .join()
                     .expect("thread should not panic");
-                if ret {
+                if let Some(confirmation) = ret {
                     signals.0.store(true, atomic::Ordering::Relaxed);
-                    return;
+                    return confirmation;
                 }
                 thread::park();
             }
@@ -78,33 +105,44 @@ fn wait_for_confirmation() {
     }
 }
 
-/// Repeatedly nag the user to type "CONFIRM"
-fn confirm_prompt(stop_flag: &atomic::AtomicBool) -> bool {
+/// Repeatedly nag the user to type "CONFIRM" (or "ERASE", for a factory reset)
+///
+/// "ERASE" is always accepted; it is only mentioned when the settings would otherwise be kept.
+fn confirm_prompt(stop_flag: &atomic::AtomicBool, offer_erase: bool) -> Option<Confirmation> {
     const CONFIRM_KEYWORD: &str = "CONFIRM";
+    const ERASE_KEYWORD: &str = "ERASE";
 
     let mut input = String::new();
     loop {
         if stop_flag.load(atomic::Ordering::Relaxed) {
-            return false;
+            return None;
         }
-        eprint!("Type \"{CONFIRM_KEYWORD}\" to continue: ");
+        if offer_erase {
+            eprint!(
+                "Type \"{CONFIRM_KEYWORD}\" to continue keeping settings, \
+                 or \"{ERASE_KEYWORD}\" to erase them: "
+            );
+        } else {
+            eprint!("Type \"{CONFIRM_KEYWORD}\" to continue: ");
+        }
         input.clear();
         match io::stdin().read_line(&mut input) {
-            Ok(_) if input.trim_end() == CONFIRM_KEYWORD => return true,
-            Ok(0) => return false,
+            Ok(_) if input.trim_end() == CONFIRM_KEYWORD => return Some(Confirmation::Proceed),
+            Ok(_) if input.trim_end() == ERASE_KEYWORD => return Some(Confirmation::FactoryReset),
+            Ok(0) => return None,
             _ => continue,
         };
     }
 }
 
 /// Monitor for a key being pressed three times
-fn confirm_keypress(stop_flag: &atomic::AtomicBool) -> bool {
+fn confirm_keypress(stop_flag: &atomic::AtomicBool) -> Option<Confirmation> {
     const KEYPRESS_TIMEOUT: Duration = Duration::from_millis(500);
     const KEYPRESS_TIMES: u8 = 3;
 
     let mut device = match evdev::raw_stream::RawDevice::open(KEYS_EVDEV_PATH) {
         Ok(device) => device,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     let mut last_key = None;
@@ -113,12 +151,12 @@ fn confirm_keypress(stop_flag: &atomic::AtomicBool) -> bool {
 
     loop {
         if stop_flag.load(atomic::Ordering::Relaxed) {
-            return false;
+            return None;
         }
 
         let events = match device.fetch_events() {
             Ok(events) => events,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         for event in events {
@@ -146,13 +184,13 @@ fn confirm_keypress(stop_flag: &atomic::AtomicBool) -> bool {
                 .and_then(|x| timestamp.duration_since(x).ok());
 
             // If past the timeout (or None), start over
-            if time_elapsed.map_or(true, |x| x > KEYPRESS_TIMEOUT) {
+            if time_elapsed.is_none_or(|x| x > KEYPRESS_TIMEOUT) {
                 times_pressed = 0;
             }
 
             times_pressed += 1;
             if times_pressed >= KEYPRESS_TIMES {
-                return true;
+                return Some(Confirmation::Proceed);
             }
         }
     }
@@ -176,12 +214,14 @@ fn main() -> ! {
         wait_forever();
     };
 
-    let pre_upgrade = || {
-        eprintln!("{INSTRUCTIONS}");
-        wait_for_confirmation();
+    let mode = install_mode_from_cmdline();
+
+    let confirm = |plan: &SettingsPlan| {
+        eprintln!("{}", instructions(plan));
+        wait_for_confirmation(plan.keeps_settings())
     };
 
-    if let Err(error) = upgrade_bmc(rootfs, bootloader, pre_upgrade, led_tx.clone()) {
+    if let Err(error) = upgrade_bmc(rootfs, bootloader, mode, confirm, led_tx.clone()) {
         eprintln!("[-] Installation error:\n{error}");
         let _ = led_tx.send(led::LED_ERROR);
     } else {

@@ -112,10 +112,10 @@ impl NandImpl {
 
     fn do_format(&mut self, ebt: &mut Ebt) -> anyhow::Result<()> {
         match self {
-            Self::Sim(nand) => format(nand, ebt),
+            Self::Sim(nand) => format(nand, ebt, &Default::default()),
 
             #[cfg(target_os = "linux")]
-            Self::Mtd(nand) => format(nand, ebt),
+            Self::Mtd(nand) => format(nand, ebt, &Default::default()),
         }
     }
 }

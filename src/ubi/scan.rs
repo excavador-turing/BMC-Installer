@@ -125,7 +125,7 @@ fn test_scan() -> anyhow::Result<()> {
     // Confirm that, on a fresh NAND, every block scans as "erased"
     let blocks = scan_blocks(&mut nand)?;
     assert_eq!(blocks.len(), nand.get_layout().blocks as usize);
-    assert!(blocks.into_iter().all(|&x| x == BlockContent::Erased));
+    assert!(blocks.iter().all(|&x| x == BlockContent::Erased));
 
     // Now modify several blocks for various states:
     use BlockContent::*;

@@ -13,12 +13,9 @@ use std::{fs, path::Path};
 
 use crate::{
     format, image,
+    install::{self, InstallMode, SettingsPlan},
     nand::{mtd::MtdNand, Nand},
-    ubi::{
-        self,
-        ubinize::{BasicVolume, Volume},
-        VolType,
-    },
+    ubi::{self, ubinize::Volume},
 };
 
 use self::led::LedState;
@@ -69,51 +66,116 @@ pub fn wait_forever() -> ! {
     }
 }
 
+/// The kernel command-line word that asks for a factory reset. U-Boot adds it when the microSD
+/// card carries a `factory-reset.txt`.
+const FACTORY_RESET_CMDLINE: &str = "factory_reset";
+
+/// Determine the [InstallMode] asked for on the kernel command line: [InstallMode::FactoryReset]
+/// if it contains the word `factory_reset`, otherwise [InstallMode::KeepSettings].
+///
+/// `/proc` must be mounted (see [setup_initramfs]). If the command line cannot be read, settings
+/// are kept when possible, as they would be with no request at all.
+pub fn install_mode_from_cmdline() -> InstallMode {
+    let requested = fs::read_to_string("/proc/cmdline")
+        .map(|cmdline| {
+            cmdline
+                .split_whitespace()
+                .any(|word| word == FACTORY_RESET_CMDLINE)
+        })
+        .unwrap_or(false);
+
+    match requested {
+        true => InstallMode::FactoryReset,
+        false => InstallMode::KeepSettings,
+    }
+}
+
+/// How the user answered the confirmation prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Go ahead with what the prompt said would happen.
+    Proceed,
+
+    /// Go ahead, but erase the settings even if they could have been kept.
+    FactoryReset,
+}
+
+/// The size of the whole NAND chip, in PEBs of the `ubi` partition.
+///
+/// UBI sizes its bad-block reserve from the whole chip, not the partition. On the Turing Pi 2 the
+/// chip is exactly `boot` followed by `ubi` (see the board's device tree).
+fn device_pebs(nand_boot: &impl Nand, nand_ubi: &impl Nand) -> u32 {
+    let block_bytes = |layout: crate::nand::NandLayout| {
+        u64::from(layout.pages_per_block) * layout.bytes_per_page as u64
+    };
+    let boot = nand_boot.get_layout();
+    let ubi = nand_ubi.get_layout();
+    let boot_bytes = u64::from(boot.blocks) * block_bytes(boot);
+    let boot_pebs = boot_bytes.div_ceil(block_bytes(ubi)) as u32;
+    boot_pebs + ubi.blocks
+}
+
 /// This is the core function of the installer. Several tasks are executed to
 /// upgrade from v1.x firmware or to install onto new flash.
+///
+/// The `ubi` partition is analyzed first, read-only, to decide whether the board's settings can be
+/// kept (only ever with [InstallMode::KeepSettings]). `confirm` is then shown that decision and
+/// blocks until the user agrees; it may still ask for a factory reset instead. Nothing is written
+/// before `confirm` returns.
+///
+/// [InstallMode::KeepSettings] must only be used when the settings volume is not in use, i.e.
+/// from the initramfs; a mounted UBIFS changes under our feet.
 pub fn upgrade_bmc(
     mut rootfs: impl Read + Seek,
     bootloader: impl Read,
-    pre_upgrade: impl FnOnce(),
+    mode: InstallMode,
+    confirm: impl FnOnce(&SettingsPlan) -> Confirmation,
     led_tx: mpsc::Sender<&'static [LedState]>,
 ) -> anyhow::Result<()> {
     eprintln!("{}", BANNER);
 
     // Open the NAND flash partitions
     let nand_boot = MtdNand::open_named("boot")?;
-    let nand_ubi = MtdNand::open_named("ubi")?;
+    let mut nand_ubi = MtdNand::open_named("ubi")?;
 
     // Locate the rootfs and bootloader to be written
     let rootfs_size = image::erofs_size(&mut rootfs)?;
 
     // Define the UBI image
-    let ubi_volumes: Vec<Box<dyn Volume + '_>> = vec![
-        Box::new(
-            BasicVolume::new(VolType::Dynamic)
-                .id(0)
-                .name("uboot-env")
-                .size(65536),
-        ),
-        Box::new(
-            BasicVolume::new(VolType::Static)
-                .name("rootfs")
-                .skipcheck() // Opening the volume at boot takes ~10sec. longer without this flag
-                .size(rootfs_size)
-                .image(&mut rootfs),
-        ),
-    ];
+    let ubi_volumes = install::installer_volumes(&mut rootfs, rootfs_size);
+
+    // Find out what can be kept, before asking, so that the prompt can say what will happen.
+    eprintln!("Analyzing UBI partition...");
+    let ebt = ubi::scan_blocks(&mut nand_ubi)?;
+    let device_pebs = device_pebs(&nand_boot, &nand_ubi);
+    let mut plan = install::plan(&mut nand_ubi, &ebt, mode, &ubi_volumes, device_pebs);
 
     // These are the tasks to be run once the user confirms the operation:
     struct TaskCtx<'a, N: Nand, R: Read> {
         rpt: howudoin::Tx,
         nand_boot: N,
         nand_ubi: N,
-        ebt: Option<ubi::Ebt>,
+        ebt: ubi::Ebt,
+        plan: SettingsPlan,
         ubi_volumes: Vec<Box<dyn Volume + 'a>>,
         bootloader: R,
     }
     type TaskFn<Ctx> = fn(&mut Ctx) -> anyhow::Result<()>;
-    let tasks: [(&str, TaskFn<TaskCtx<'_, _, _>>); 5] = [
+
+    // Ready...
+    let _ = led_tx.send(led::LED_READY);
+
+    if confirm(&plan) == Confirmation::FactoryReset && plan != SettingsPlan::Reset {
+        eprintln!("Factory reset selected: settings will be erased.");
+        plan = SettingsPlan::Reset;
+    }
+    eprintln!("Settings: {}", plan.describe());
+
+    let format_desc = match plan.keeps_settings() {
+        true => "Formatting UBI partition (keeping settings)",
+        false => "Formatting UBI partition",
+    };
+    let tasks: [(&str, TaskFn<TaskCtx<'_, _, _>>); 4] = [
         ("Purging boot0 code", |ctx| {
             let purged = format::purge_boot0(&mut ctx.nand_boot)?;
             if purged {
@@ -122,20 +184,16 @@ pub fn upgrade_bmc(
             }
             Ok(())
         }),
-        ("Analyzing UBI partition", |ctx| {
-            let ebt = ubi::scan_blocks(&mut ctx.nand_ubi)?;
-            ctx.ebt = Some(ebt);
-            Ok(())
-        }),
-        ("Formatting UBI partition", |ctx| {
-            ubi::format(&mut ctx.nand_ubi, ctx.ebt.as_mut().unwrap())?;
+        (format_desc, |ctx| {
+            install::format_ubi(&mut ctx.nand_ubi, &mut ctx.ebt, &ctx.plan)?;
             Ok(())
         }),
         ("Writing rootfs", |ctx| {
-            ubi::write_volumes(
+            install::write_ubi(
                 &mut ctx.nand_ubi,
-                ctx.ebt.as_mut().unwrap(),
+                &mut ctx.ebt,
                 ctx.ubi_volumes.split_off(0),
+                &ctx.plan,
             )?;
             Ok(())
         }),
@@ -144,11 +202,6 @@ pub fn upgrade_bmc(
             Ok(())
         }),
     ];
-
-    // Ready...
-    let _ = led_tx.send(led::LED_READY);
-
-    pre_upgrade();
 
     // ...go!
     howudoin::init(howudoin::consumers::TermLine::default());
@@ -159,7 +212,8 @@ pub fn upgrade_bmc(
         rpt,
         nand_boot,
         nand_ubi,
-        ebt: None,
+        ebt,
+        plan,
         ubi_volumes,
         bootloader,
     };

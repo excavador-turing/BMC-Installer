@@ -91,7 +91,7 @@ impl MtdBlock<'_> {
     /// offset for the page
     fn offset_for(&self, start_page: u32, bytes: usize) -> anyhow::Result<u64> {
         ensure!(
-            bytes % self.page_size() == 0,
+            bytes.is_multiple_of(self.page_size()),
             "buffer not multiple of page size"
         );
 
@@ -172,11 +172,11 @@ mod ioctl {
             }
 
             ensure!(
-                self.size % self.erasesize == 0,
+                self.size.is_multiple_of(self.erasesize),
                 "MTD size not multiple of erasesize"
             );
             ensure!(
-                self.erasesize % self.writesize == 0,
+                self.erasesize.is_multiple_of(self.writesize),
                 "MTD erasesize not multiple of writesize"
             );
 
