@@ -227,19 +227,17 @@ impl NandBlock for &mut SimBlock {
     }
 
     fn read(&self, start_page: u32, content: &mut [u8]) -> anyhow::Result<()> {
-        let mut page = start_page;
-        for chunk in content.chunks_mut(self.page_size()) {
+        let page_size = self.page_size();
+        for (page, chunk) in (start_page..).zip(content.chunks_mut(page_size)) {
             self.read_page(page, chunk)?;
-            page += 1;
         }
         Ok(())
     }
 
     fn program(&mut self, start_page: u32, content: &[u8]) -> anyhow::Result<()> {
-        let mut page = start_page;
-        for chunk in content.chunks(self.page_size()) {
+        let page_size = self.page_size();
+        for (page, chunk) in (start_page..).zip(content.chunks(page_size)) {
             self.write_page(page, chunk)?;
-            page += 1;
         }
         Ok(())
     }

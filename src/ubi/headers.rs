@@ -8,6 +8,14 @@ use income::{EcHdr, VidHdr, VtblRecord, UBI_EC_HDR_MAGIC, UBI_VID_HDR_MAGIC};
 pub const UBI_CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_JAMCRC);
 const UBI_VERSION: u8 = 1;
 
+/// The highest erase counter UBI accepts in an EC header (`UBI_MAX_ERASECOUNTER` in
+/// drivers/mtd/ubi/ubi-media.h); `validate_ec_hdr` in io.c rejects anything above it, and a
+/// rejected EC header makes the whole attach fail.
+pub const UBI_MAX_ERASECOUNTER: u64 = 0x7FFF_FFFF;
+
+/// The longest volume name UBI accepts (`UBI_VOL_NAME_MAX`)
+const UBI_VOL_NAME_MAX: usize = 127;
+
 /// A trait missing from the `income` crate: implements parsing UBI headers from byteslices, with
 /// magic and CRC verification.
 pub trait ParseHeader<'a>: Sized + DekuContainerRead<'a> + ComputeCrc {
@@ -118,8 +126,11 @@ impl Ec {
     }
 
     /// Increment the erase counter of this EC header
+    ///
+    /// The counter comes from flash, so it may be anything; the result never exceeds
+    /// [UBI_MAX_ERASECOUNTER], so that UBI accepts the header.
     pub fn inc_ec(mut self) -> Self {
-        self.ec += 1;
+        self.ec = self.ec.saturating_add(1).min(UBI_MAX_ERASECOUNTER);
         self
     }
 
@@ -267,6 +278,12 @@ impl Vid {
         VidHdr::parse(bytes).and_then(|x| x.try_into().ok())
     }
 
+    /// The volume ID in a VID header that passes its magic, version and CRC checks, even if
+    /// [Vid::decode] rejects one of its fields.
+    pub fn peek_vol_id(bytes: &[u8]) -> Option<u32> {
+        VidHdr::parse(bytes).map(|x| x.vol_id)
+    }
+
     /// Write into a byte slice
     pub fn encode(self, out_bytes: &mut [u8]) -> anyhow::Result<()> {
         let bytes = VidHdr::from(self).to_bytes()?;
@@ -297,7 +314,11 @@ impl TryFrom<VidHdr> for Vid {
         } = value;
 
         let vol_type = vol_type.try_into()?;
-        let copy_flag = copy_flag != 0;
+        let copy_flag = match copy_flag {
+            0 => false,
+            1 => true,
+            _ => return Err(()),
+        };
 
         Ok(Self {
             vol_type,
@@ -410,7 +431,11 @@ impl VolTableRecord {
             return VtblSlot::Corrupt;
         }
         if vtblrec.reserved_pebs == 0 {
-            return VtblSlot::Empty;
+            // `vtbl_check` requires an unused slot to be exactly the canonical empty record.
+            return match vtblrec.to_bytes() == Ok(Self::none_into_bytes()) {
+                true => VtblSlot::Empty,
+                false => VtblSlot::Corrupt,
+            };
         }
         match vtblrec.try_into() {
             Ok(record) => VtblSlot::Volume(record),
@@ -484,11 +509,31 @@ impl TryFrom<VtblRecord> for VolTableRecord {
             ..
         } = value;
 
+        // These are the geometry-independent rules of `vtbl_check` (drivers/mtd/ubi/vtbl.c):
+        // fields the kernel reads as `int` must not be negative, upd_marker is 0 or 1, and the
+        // name is 1..=127 bytes, without a NUL inside, NUL-terminated within the 128-byte field.
+        // The values come from flash, so nothing here may index out of bounds.
+        if [reserved_pebs, alignment, data_pad]
+            .iter()
+            .any(|&x| x > i32::MAX as u32)
+        {
+            return Err(());
+        }
         let vol_type = vol_type.try_into()?;
-        let upd_marker = upd_marker != 0;
-        let name = std::str::from_utf8(&name[..name_len as usize])
-            .map_err(|_| ())?
-            .to_string();
+        let upd_marker = match upd_marker {
+            0 => false,
+            1 => true,
+            _ => return Err(()),
+        };
+        let name_len = usize::from(name_len);
+        if name_len == 0 || name_len > UBI_VOL_NAME_MAX || name.get(name_len) != Some(&0) {
+            return Err(());
+        }
+        let name = &name[..name_len];
+        if name.contains(&0) {
+            return Err(());
+        }
+        let name = std::str::from_utf8(name).map_err(|_| ())?.to_string();
 
         Ok(Self {
             reserved_pebs,

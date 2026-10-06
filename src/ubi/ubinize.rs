@@ -8,7 +8,7 @@
 use super::headers::{OptionIntoBytes, Vid, VolTableRecord, VolType, UBI_CRC};
 use crate::util::ReadExt;
 
-use anyhow::{bail, ensure};
+use anyhow::ensure;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -33,6 +33,11 @@ pub trait Volume {
     /// the volume table, so it cannot be moved; every other volume is allocated around it.
     fn requires_vol_id(&self) -> bool {
         false
+    }
+
+    /// The volume's name, as it will appear in the volume table ("" if it has none).
+    fn vol_name(&self) -> &str {
+        ""
     }
 
     /// Estimate how many blocks this `Volume` will occupy at the given `eb_size`.
@@ -125,24 +130,17 @@ impl Volume for LayoutVolume {
             ..Default::default()
         };
 
-        // UBI refuses to attach when more than one volume carries the autoresize flag (see
-        // `init_volumes` in drivers/mtd/ubi/vtbl.c). A newly written volume asking for it wins;
-        // a preserved volume has long since been resized by the kernel anyway.
+        // A preserved volume never keeps the autoresize flag. UBI refuses to attach when more
+        // than one volume carries it (see `init_volumes` in drivers/mtd/ubi/vtbl.c), and a kept
+        // volume that grew over every free PEB would leave no room for the next OTA update. The
+        // kernel clears the flag after its first resize anyway, so a running board never has it.
         let LayoutVolume {
             mut records,
             preserved_ids,
         } = *self;
-        let new_autoresize = records.iter().enumerate().any(|(id, record)| {
-            !preserved_ids.contains(&(id as u32))
-                && record
-                    .as_ref()
-                    .is_some_and(|r| r.flags & UBI_VTBL_AUTORESIZE_FLG != 0)
-        });
-        if new_autoresize {
-            for &id in &preserved_ids {
-                if let Some(record) = records[id as usize].as_mut() {
-                    record.flags &= !UBI_VTBL_AUTORESIZE_FLG;
-                }
+        for &id in &preserved_ids {
+            if let Some(record) = records[id as usize].as_mut() {
+                record.flags &= !UBI_VTBL_AUTORESIZE_FLG;
             }
         }
 
@@ -333,11 +331,17 @@ impl Volume for BasicVolume<'_> {
         self.id
     }
 
+    fn vol_name(&self) -> &str {
+        &self.name
+    }
+
     fn estimate_blocks(&self, eb_size: NonZeroU32) -> u32 {
         let eb_size: u32 = eb_size.into();
         let data_pad = eb_size % self.alignment;
         let leb_size = eb_size - data_pad;
-        ((self.size.unwrap_or(0) + (leb_size - 1) as u64) / leb_size as u64) as u32
+        // The size may come from an image header; saturate rather than overflow.
+        let blocks = self.size.unwrap_or(0).div_ceil(u64::from(leb_size));
+        blocks.try_into().unwrap_or(u32::MAX)
     }
 }
 
@@ -418,6 +422,10 @@ impl Volume for PreservedVolume {
         true
     }
 
+    fn vol_name(&self) -> &str {
+        &self.record.name
+    }
+
     fn estimate_blocks(&self, _: NonZeroU32) -> u32 {
         // Nothing is written: the PEBs are already on flash.
         0
@@ -457,7 +465,7 @@ impl<'a> Ubinizer<'a> {
             .into_iter()
             .map(|x| x.estimate_blocks(eb_size))
             .chain(std::iter::once(UBI_LAYOUT_VOLUME_EBS))
-            .sum()
+            .fold(0u32, u32::saturating_add)
     }
 
     /// Create a new [Ubinizer], which will build an image with the given volumes that fits in
@@ -473,6 +481,17 @@ impl<'a> Ubinizer<'a> {
     ) -> anyhow::Result<Self> {
         let volumes: Vec<_> = volumes.into_iter().collect();
         let mut layout = Box::new(LayoutVolume::new(eb_size));
+
+        // UBI refuses to attach a volume table with two volumes of the same name (see
+        // `vtbl_check` in drivers/mtd/ubi/vtbl.c); find out now, before anything is written.
+        let mut names = BTreeSet::new();
+        for volume in &volumes {
+            let name = volume.vol_name();
+            ensure!(
+                name.is_empty() || names.insert(name),
+                "two volumes are named {name:?}"
+            );
+        }
         let slots = layout.records.len() as u32;
 
         let mut ids: Vec<Option<u32>> = vec![None; volumes.len()];
@@ -577,7 +596,10 @@ impl<'a> Ubinizer<'a> {
             // As long as `current_data` is providing blocks, just keep consuming it:
             if let Some(vid) = current_data.next_block(data)? {
                 assert_eq!(vid.vol_id, self.current_id);
-                self.sqnum += 1;
+                self.sqnum = self
+                    .sqnum
+                    .checked_add(1)
+                    .ok_or(anyhow::anyhow!("sequence numbers exhausted"))?;
                 return Ok(Some(vid.sqnum(self.sqnum)));
             }
 
@@ -588,19 +610,6 @@ impl<'a> Ubinizer<'a> {
             // If we still have the layout volume, tell it about the vtbl record.
             if let Some(ref mut layout) = self.layout {
                 let record = current_data.into_vtbl_record();
-
-                // UBI refuses to attach a volume table with two volumes of the same name (see
-                // `vtbl_check` in drivers/mtd/ubi/vtbl.c), so never write one.
-                if !record.name.is_empty()
-                    && layout
-                        .records
-                        .iter()
-                        .flatten()
-                        .any(|x| x.name == record.name)
-                {
-                    bail!("two volumes are named {:?}", record.name);
-                }
-
                 layout.store_record(self.current_id, record);
             }
 

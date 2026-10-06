@@ -14,7 +14,7 @@
 //! which is what the installer has always done.
 
 use super::format::{compute_prototype, leb_size};
-use super::headers::{Ec, Vid, VolTableRecord, VolType, VtblSlot};
+use super::headers::{Ec, Vid, VolTableRecord, VolType, VtblSlot, UBI_MAX_ERASECOUNTER};
 use super::scan::{BlockContent, Ebt};
 use super::ubinize::{vtbl_slots, PreservedVolume, UBI_LAYOUT_VOLUME_ID, UBI_VTBL_RECORD_SIZE};
 use crate::nand::{Nand, NandBlock};
@@ -67,6 +67,10 @@ pub struct Preserved {
     /// Every PEB holding one of its LEBs, including older duplicate copies (UBI resolves those at
     /// attach time, by sqnum, and the newer copy may fail its data CRC check)
     pub pebs: BTreeSet<u32>,
+
+    /// The EC header prototype the kept PEBs were checked against; [super::format] must write
+    /// exactly this one to every other PEB.
+    pub proto: Ec,
 }
 
 impl Preserved {
@@ -77,10 +81,18 @@ impl Preserved {
 }
 
 /// Read the data area of a PEB, `len` bytes (rounded up to whole pages).
+///
+/// `ec.data_offset` comes from flash; anything that does not land inside the block is a refusal.
 fn read_data<N: Nand>(nand: &mut N, peb: u32, ec: Ec, len: usize) -> Result<Vec<u8>, Refusal> {
-    let page_size = nand.get_layout().bytes_per_page;
+    let layout = nand.get_layout();
+    let page_size = layout.bytes_per_page;
     let start_page = ec.data_offset as usize / page_size;
     let pages = len.div_ceil(page_size);
+    if !(ec.data_offset as usize).is_multiple_of(page_size)
+        || start_page.saturating_add(pages) > layout.pages_per_block as usize
+    {
+        refuse!("PEB {peb} has an unexpected data offset");
+    }
 
     let block = match nand.block(peb) {
         Ok(Some(block)) => block,
@@ -115,18 +127,32 @@ fn newest_copies(ebt: &Ebt, vol_id: u32) -> BTreeMap<u32, (u32, Ec, Vid)> {
     lebs
 }
 
+/// Check a volume table record against the geometry-dependent rules of `vtbl_check`
+/// (drivers/mtd/ubi/vtbl.c): `alignment` is 1..=LEB size and 1 or a multiple of the minimal I/O
+/// unit, and `data_pad` is what that alignment leaves over. The other rules are enforced when the
+/// record is decoded ([VolTableRecord::decode_slot]).
+fn record_fits_geometry(record: &VolTableRecord, leb_size: u32, min_io: u32) -> bool {
+    let alignment = record.alignment;
+    alignment != 0
+        && alignment <= leb_size
+        && (alignment == 1 || alignment.is_multiple_of(min_io))
+        && record.data_pad == leb_size % alignment
+}
+
 /// Read and decode both copies of the volume table (LEB 0 and LEB 1 of the layout volume).
 ///
-/// Either copy missing, unreadable, or holding a slot that fails its CRC is a refusal: the kernel
-/// would recover from one good copy, but here there is no reason to trust a table UBI itself would
-/// have to repair.
+/// Either copy missing, unreadable, or holding a slot that the kernel's `vtbl_check` would reject
+/// is a refusal: the kernel would recover from one good copy, but here there is no reason to trust
+/// a table UBI itself would have to repair. So is a name used twice anywhere in the table.
 pub(crate) fn read_volume_tables<N: Nand>(
     nand: &mut N,
     ebt: &Ebt,
 ) -> Result<[Vec<Option<VolTableRecord>>; 2], Refusal> {
     let layout = nand.get_layout();
-    let slots = vtbl_slots(leb_size(layout));
+    let leb_size = leb_size(layout);
+    let slots = vtbl_slots(leb_size);
     let table_len = slots * UBI_VTBL_RECORD_SIZE;
+    let min_io = layout.bytes_per_page as u32;
 
     let copies = newest_copies(ebt, UBI_LAYOUT_VOLUME_ID);
     if let Some(&lnum) = copies.keys().find(|&&lnum| lnum > 1) {
@@ -139,11 +165,22 @@ pub(crate) fn read_volume_tables<N: Nand>(
             refuse!("copy {} of the volume table is missing", lnum + 1);
         };
         let bytes = read_data(nand, peb, ec, table_len)?;
-        for record in bytes.chunks_exact(UBI_VTBL_RECORD_SIZE) {
+        for record in bytes.as_chunks::<UBI_VTBL_RECORD_SIZE>().0 {
             match VolTableRecord::decode_slot(record) {
                 VtblSlot::Empty => table.push(None),
-                VtblSlot::Volume(record) => table.push(Some(record)),
-                VtblSlot::Corrupt => refuse!("copy {} of the volume table is corrupt", lnum + 1),
+                VtblSlot::Volume(record)
+                    if record_fits_geometry(&record, leb_size.into(), min_io) =>
+                {
+                    table.push(Some(record))
+                }
+                _ => refuse!("copy {} of the volume table is corrupt", lnum + 1),
+            }
+        }
+
+        let mut names = BTreeSet::new();
+        for record in table.iter().flatten() {
+            if !names.insert(&record.name) {
+                refuse!("the volume table names two volumes {:?}", record.name);
             }
         }
     }
@@ -151,33 +188,51 @@ pub(crate) fn read_volume_tables<N: Nand>(
     Ok(tables)
 }
 
-/// Find the one record called `name` in a volume table, returning its ID (its index).
-fn find_record(
-    table: &[Option<VolTableRecord>],
-    name: &str,
-) -> Result<Option<(u32, VolTableRecord)>, Refusal> {
-    let mut found = table
+/// Find the record called `name` in a volume table, returning its ID (its index). Names are
+/// unique, see [read_volume_tables].
+fn find_record(table: &[Option<VolTableRecord>], name: &str) -> Option<(u32, VolTableRecord)> {
+    table
         .iter()
         .enumerate()
-        .filter_map(|(id, record)| Some((id as u32, record.as_ref()?)))
-        .filter(|(_, record)| record.name == name);
+        .find_map(|(id, record)| match record {
+            Some(record) if record.name == name => Some((id as u32, record.clone())),
+            _ => None,
+        })
+}
 
-    let first = found.next();
-    if found.next().is_some() {
-        refuse!("the volume table names two volumes {name:?}");
-    }
-    Ok(first.map(|(id, record)| (id, record.clone())))
+/// Check a kept PEB's VID header the way `validate_vid_hdr` (drivers/mtd/ubi/io.c) does for a
+/// dynamic user volume. UBI fails the whole attach (-EINVAL) on a header it rejects, so a single
+/// such PEB kept would leave the board unbootable.
+fn vid_is_valid(vid: &Vid, leb_size: u32) -> bool {
+    let dynamic_data_ok = match vid.copy_flag {
+        // An ordinary write of a dynamic LEB carries no data size or CRC
+        false => vid.data_size == 0 && vid.data_crc == 0,
+        // A copy made by wear-leveling carries both
+        true => vid.data_size != 0,
+    };
+    vid.vol_type == VolType::Dynamic
+        && vid.compat == 0
+        && vid.used_ebs == 0
+        && vid.data_size <= leb_size
+        && vid.data_pad < leb_size / 2
+        && dynamic_data_ok
 }
 
 /// Find the volume named `name` and check that it can be kept bit-for-bit across a reimaging.
 ///
 /// This only reads from flash. It must be called on the [Ebt] from [super::scan_blocks], before
 /// [super::format] changes anything, and the result only holds for that same [Ebt].
+///
+/// Every value it looks at comes from flash and may be anything; any check that cannot be passed
+/// for certain is a [Refusal].
 pub fn find_preserved_volume<N: Nand>(
     nand: &mut N,
     ebt: &Ebt,
     name: &str,
 ) -> Result<Preserved, Refusal> {
+    let layout = nand.get_layout();
+    let leb_size = u32::from(leb_size(layout));
+
     // A board still on the v1.x NAND layout has to be migrated, which rewrites every PEB, and its
     // firmware never had this volume anyway.
     if ebt.iter().any(|x| matches!(x, BlockContent::RawVid(_))) {
@@ -186,16 +241,20 @@ pub fn find_preserved_volume<N: Nand>(
 
     // Every EC header that survives must match the ones `format` is about to write: UBI refuses
     // to attach when image_seq differs between PEBs (`scan_peb` in drivers/mtd/ubi/attach.c), or
-    // when the VID header or data offsets differ from its own (`validate_ec_hdr` in io.c).
-    let proto = match compute_prototype(nand.get_layout(), ebt.iter().copied()) {
+    // when the VID header or data offsets differ from its own, or the erase counter is out of
+    // range (`validate_ec_hdr` in io.c).
+    let proto = match compute_prototype(layout, ebt.iter().copied()) {
         Ok(proto) => proto,
         Err(e) => refuse!("the UBI headers could not be analyzed: {e}"),
     };
-    let matches_proto = |ec: Ec| ec == proto.ec(ec.ec);
+    let matches_proto = |ec: Ec| ec == proto.ec(ec.ec) && ec.ec <= UBI_MAX_ERASECOUNTER;
 
     let layout_copies = newest_copies(ebt, UBI_LAYOUT_VOLUME_ID);
     if layout_copies.is_empty() {
-        refuse!("the flash holds no UBI volumes (blank or never installed)");
+        refuse!(
+            "the flash holds no UBI volumes (blank, never installed, \
+             or an earlier install was interrupted)"
+        );
     }
     for (lnum, &(peb, ec, _)) in &layout_copies {
         if !matches_proto(ec) {
@@ -204,10 +263,10 @@ pub fn find_preserved_volume<N: Nand>(
     }
 
     let [table0, table1] = read_volume_tables(nand, ebt)?;
-    let Some((vol_id, record)) = find_record(&table0, name)? else {
+    let Some((vol_id, record)) = find_record(&table0, name) else {
         refuse!("no {name:?} volume was found");
     };
-    if find_record(&table1, name)? != Some((vol_id, record.clone())) {
+    if find_record(&table1, name) != Some((vol_id, record.clone())) {
         refuse!("the two copies of the volume table disagree about {name:?}");
     }
 
@@ -218,9 +277,40 @@ pub fn find_preserved_volume<N: Nand>(
         refuse!("the {name:?} volume was left half-updated");
     }
 
+    // A PEB whose EC header is damaged, or whose VID header the scan rejected, is erased by
+    // `format`. The kernel may still have used it (`scan_peb` in attach.c reads the VID header of
+    // a PEB with a bad EC header), so if its VID header names this volume or the volume table,
+    // keeping would silently lose data.
+    for (peb, content) in ebt.iter().enumerate() {
+        if !matches!(
+            content,
+            BlockContent::Garbage | BlockContent::EcData(_, None)
+        ) {
+            continue;
+        }
+        let page_size = layout.bytes_per_page;
+        let mut page = vec![0u8; page_size];
+        let read = match nand.block(peb as u32) {
+            Ok(Some(block)) => block.read(1, &mut page),
+            Ok(None) => continue,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = read {
+            refuse!("PEB {peb} could not be read: {e}");
+        }
+        if let Some(peeked) = Vid::peek_vol_id(&page) {
+            if peeked == vol_id || peeked == UBI_LAYOUT_VOLUME_ID {
+                refuse!("PEB {peb} has a damaged UBI header but holds data of {name:?}");
+            }
+        }
+    }
+
     // Collect every PEB of the volume, duplicates included, checking each the way UBI will when
-    // it attaches (`check_av` in drivers/mtd/ubi/vtbl.c).
+    // it attaches (`validate_vid_hdr` in io.c, `ubi_compare_lebs` in attach.c, `check_av` in
+    // vtbl.c).
     let mut pebs = BTreeSet::new();
+    let mut sqnums: BTreeSet<(u32, u64)> = BTreeSet::new();
+    let mut max_sqnum = 0;
     for (peb, content) in ebt.iter().enumerate() {
         let BlockContent::EcData(ec, Some(vid)) = *content else {
             continue;
@@ -236,10 +326,10 @@ pub fn find_preserved_volume<N: Nand>(
             );
         }
         if !matches_proto(ec) {
-            refuse!("PEB {peb} of {name:?} has an unexpected UBI header layout");
+            refuse!("PEB {peb} of {name:?} has an unexpected UBI header");
         }
-        if vid.vol_type != VolType::Dynamic || vid.data_pad != record.data_pad {
-            refuse!("PEB {peb} of {name:?} does not match its volume table record");
+        if !vid_is_valid(&vid, leb_size) || vid.data_pad != record.data_pad {
+            refuse!("PEB {peb} of {name:?} has a VID header UBI would reject");
         }
         if vid.lnum >= record.reserved_pebs {
             refuse!(
@@ -247,7 +337,21 @@ pub fn find_preserved_volume<N: Nand>(
                 vid.lnum
             );
         }
+        // Two copies of one LEB with the same sqnum cannot be ordered: UBI fails the attach.
+        if !sqnums.insert((vid.lnum, vid.sqnum)) {
+            refuse!(
+                "two copies of LEB {} of {name:?} have the same sequence number",
+                vid.lnum
+            );
+        }
+        max_sqnum = max_sqnum.max(vid.sqnum);
         pebs.insert(peb as u32);
+    }
+
+    // The new headers are numbered above the kept ones; leave plenty of room for that and for
+    // the kernel's own counter.
+    if max_sqnum >= 1 << 63 {
+        refuse!("the sequence numbers of {name:?} are implausibly high");
     }
 
     // The volume must actually hold a UBIFS: its LEB 0 starts with the superblock node.
@@ -263,6 +367,7 @@ pub fn find_preserved_volume<N: Nand>(
         vol_id,
         record,
         pebs,
+        proto,
     })
 }
 

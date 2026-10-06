@@ -60,7 +60,7 @@ impl Board {
     fn build(&self, with_overlay: bool) -> SimNand {
         let mut nand = SimNand::new(LAYOUT);
         let mut ebt = scan_blocks(&mut nand).unwrap();
-        format(&mut nand, &mut ebt, &Default::default()).unwrap();
+        format(&mut nand, &mut ebt, None).unwrap();
 
         let mut prev = &[0x11u8; 3 * LEB][..];
         let mut cur = &[0x22u8; 3 * LEB][..];
@@ -219,22 +219,73 @@ fn volume_data(nand: &mut SimNand, vol_id: u32) -> Vec<u8> {
     data
 }
 
-/// Check what the kernel checks when attaching (drivers/mtd/ubi/attach.c, vtbl.c): one image_seq,
-/// every VID header pointing to a volume in the table with its LEB inside the volume and the same
-/// type, at most one autoresize volume, and enough good PEBs for every reservation.
+/// Check an EC header the way `validate_ec_hdr` (drivers/mtd/ubi/io.c) does
+fn assert_ec_valid(ec: &Ec) {
+    let page = LAYOUT.bytes_per_page as u32;
+    assert_eq!(ec.vid_hdr_offset, page, "bad VID header offset");
+    assert_eq!(ec.data_offset, 2 * page, "bad data offset");
+    assert!(ec.ec <= 0x7FFF_FFFF, "bad erase counter {}", ec.ec);
+}
+
+/// Check a VID header the way `validate_vid_hdr` (drivers/mtd/ubi/io.c) does
+fn assert_vid_valid(vid: &Vid) {
+    let leb = LEB as u32;
+    let internal = vid.vol_id >= LAYOUT_VOL_ID;
+    assert!(internal || vid.vol_id < 128, "bad vol_id {}", vid.vol_id);
+    match internal {
+        false => assert_eq!(vid.compat, 0, "bad compat"),
+        true => assert!([1, 2, 4, 5].contains(&vid.compat), "bad compat"),
+    }
+    assert!(vid.data_pad < leb / 2, "bad data_pad");
+    assert!(vid.data_size <= leb, "bad data_size");
+    match vid.vol_type {
+        VolType::Static => {
+            assert!(vid.used_ebs != 0 && vid.data_size != 0);
+            if vid.lnum < vid.used_ebs - 1 {
+                assert_eq!(vid.data_size, leb - vid.data_pad);
+            } else {
+                assert!(vid.lnum < vid.used_ebs, "too high lnum");
+            }
+        }
+        VolType::Dynamic => {
+            match vid.copy_flag {
+                false => assert!(vid.data_size == 0 && vid.data_crc == 0),
+                true => assert!(vid.data_size != 0),
+            }
+            assert_eq!(vid.used_ebs, 0, "bad used_ebs");
+        }
+    }
+}
+
+/// Check what the kernel checks when attaching (drivers/mtd/ubi/attach.c, io.c, vtbl.c): every EC
+/// and VID header valid, one image_seq, no two copies of a LEB with the same sqnum, a volume table
+/// `vtbl_check` accepts (both copies equal, see [volume_table]), every VID header pointing to a
+/// volume in the table with its LEB inside the volume and the same type, at most one autoresize
+/// volume, and enough good PEBs for every reservation.
 fn assert_attachable(nand: &mut SimNand) {
     let ebt = scan_blocks(nand).unwrap();
     let table = volume_table(nand);
     let by_id: BTreeMap<u32, &VolTableRecord> = table.values().map(|(id, r)| (*id, r)).collect();
 
     let mut image_seqs = BTreeSet::new();
+    let mut copies = BTreeSet::new();
     for content in ebt.iter() {
         match content {
             BlockContent::EcErased(ec) => {
+                assert_ec_valid(ec);
                 image_seqs.insert(ec.image_seq);
             }
             BlockContent::EcData(ec, Some(vid)) => {
+                assert_ec_valid(ec);
+                assert_vid_valid(vid);
                 image_seqs.insert(ec.image_seq);
+                assert!(
+                    copies.insert((vid.vol_id, vid.lnum, vid.sqnum)),
+                    "two copies of {}:{} with sqnum {}",
+                    vid.vol_id,
+                    vid.lnum,
+                    vid.sqnum
+                );
                 if vid.vol_id == LAYOUT_VOL_ID {
                     continue;
                 }
@@ -392,7 +443,7 @@ fn test_factory_reset_mode() {
     let rootfs = new_rootfs();
     let mut image = &rootfs[..];
     let mut ebt = scan_blocks(&mut reference).unwrap();
-    format(&mut reference, &mut ebt, &Default::default()).unwrap();
+    format(&mut reference, &mut ebt, None).unwrap();
     write_volumes(
         &mut reference,
         &mut ebt,
@@ -610,11 +661,18 @@ fn test_preserved_volume_id_and_autoresize() {
     };
 
     // The preserved volume keeps its ID even though it comes last; the other one goes around it.
+    // It never keeps the autoresize flag, whether or not a new volume asks for it.
     let (preserved, other) = tables(false);
-    assert_eq!(preserved, record);
+    assert_eq!(
+        preserved,
+        VolTableRecord {
+            flags: 0,
+            ..record.clone()
+        }
+    );
     assert_eq!(other.name, "other");
+    assert_eq!(other.flags, 0);
 
-    // Only one volume may carry the autoresize flag; the new one wins.
     let (preserved, other) = tables(true);
     assert_eq!(preserved.flags, 0);
     assert_eq!(other.flags, 0x01);
@@ -647,4 +705,342 @@ fn test_refuse_blank_flash() {
     install(&mut reset, InstallMode::FactoryReset);
     assert!(dump(&mut nand) == dump(&mut reset));
     assert_attachable(&mut nand);
+}
+
+// Flash content that UBI would reject, or that the parser must survive. Each of these started as a
+// proof of concept from a security review, against which the installer either panicked or kept
+// the settings in a way that left a UBI the kernel refuses to attach.
+
+/// Rewrite the VID header of a block
+fn rewrite_vid(nand: &mut SimNand, peb: u32, modify: impl FnOnce(&mut Vid)) {
+    rewrite_block(nand, peb, |raw| {
+        let page = LAYOUT.bytes_per_page;
+        let mut vid = Vid::decode(&raw[page..]).unwrap();
+        modify(&mut vid);
+        vid.encode(&mut raw[page..2 * page]).unwrap();
+    });
+}
+
+/// Write the same raw bytes into slot `id` of both copies of the volume table
+fn rewrite_slot_raw(nand: &mut SimNand, id: usize, bytes: &[u8]) {
+    let ebt = scan_blocks(nand).unwrap();
+    for lnum in [0, 1] {
+        let peb = find_pebs(&ebt, LAYOUT_VOL_ID)[&lnum][0];
+        rewrite_block(nand, peb, |raw| {
+            let at = 2 * LAYOUT.bytes_per_page + id * VTBL_RECORD;
+            raw[at..at + VTBL_RECORD].copy_from_slice(bytes);
+        });
+    }
+}
+
+/// A raw volume table record with a correct CRC
+fn raw_vtbl_record(modify: impl FnOnce(&mut [u8])) -> Vec<u8> {
+    let mut r = vec![0u8; VTBL_RECORD];
+    r[0..4].copy_from_slice(&5u32.to_be_bytes()); // reserved_pebs
+    r[4..8].copy_from_slice(&1u32.to_be_bytes()); // alignment
+    r[12] = 1; // dynamic
+    r[14..16].copy_from_slice(&1u16.to_be_bytes()); // name_len
+    r[16] = b'x';
+    modify(&mut r);
+    let crc = crate::ubi::UBI_CRC.checksum(&r[..VTBL_RECORD - 4]);
+    r[VTBL_RECORD - 4..].copy_from_slice(&crc.to_be_bytes());
+    r
+}
+
+/// The PEB holding the newest copy of an overlay LEB
+fn overlay_peb(nand: &mut SimNand, lnum: u32) -> u32 {
+    let ebt = scan_blocks(nand).unwrap();
+    find_pebs(&ebt, Board::default().overlay_id)[&lnum][0]
+}
+
+#[test]
+fn test_decode_slot_rejects_bad_names() {
+    let name_len = |len: u16| raw_vtbl_record(|r| r[14..16].copy_from_slice(&len.to_be_bytes()));
+
+    assert!(matches!(
+        VolTableRecord::decode_slot(&raw_vtbl_record(|_| ())),
+        VtblSlot::Volume(_)
+    ));
+    // name_len past the 128-byte field used to panic (slice out of range)
+    for len in [0, 127, 128, 200, u16::MAX] {
+        assert_eq!(
+            VolTableRecord::decode_slot(&name_len(len)),
+            VtblSlot::Corrupt,
+            "{len}"
+        );
+    }
+    // NUL inside the name, or no NUL right after it
+    let nul_inside = raw_vtbl_record(|r| {
+        r[14..16].copy_from_slice(&3u16.to_be_bytes());
+        r[16..19].copy_from_slice(b"a\0b");
+    });
+    let unterminated = raw_vtbl_record(|r| {
+        r[17] = b'y';
+    });
+    let bad_upd_marker = raw_vtbl_record(|r| r[13] = 2);
+    let negative = raw_vtbl_record(|r| r[0..4].copy_from_slice(&0x8000_0000u32.to_be_bytes()));
+    // An unused slot must be exactly the canonical empty record
+    let odd_empty = raw_vtbl_record(|r| r[0..4].fill(0));
+    for bytes in [
+        nul_inside,
+        unterminated,
+        bad_upd_marker,
+        negative,
+        odd_empty,
+    ] {
+        assert_eq!(VolTableRecord::decode_slot(&bytes), VtblSlot::Corrupt);
+    }
+    assert_eq!(
+        VolTableRecord::decode_slot(&VolTableRecord::none_into_bytes()),
+        VtblSlot::Empty
+    );
+}
+
+#[test]
+fn test_refuse_name_len_out_of_range() {
+    let mut nand = Board::default().build(true);
+    rewrite_slot_raw(
+        &mut nand,
+        7,
+        &raw_vtbl_record(|r| r[14..16].copy_from_slice(&200u16.to_be_bytes())),
+    );
+    assert_refused_like_reset(nand, "corrupt");
+}
+
+#[test]
+fn test_refuse_bad_alignment() {
+    for (alignment, data_pad) in [(0, 0), (LEB as u32 * 2, 0), (3, 0), (1, 1)] {
+        let mut nand = Board::default().build(true);
+        let (id, mut record) = volume_table(&mut nand)["overlay"].clone();
+        record.alignment = alignment;
+        record.data_pad = data_pad;
+        rewrite_record(&mut nand, id, &record, &[0, 1]);
+        assert_refused_like_reset(nand, "corrupt");
+    }
+}
+
+#[test]
+fn test_refuse_equal_sqnum_copies() {
+    let mut nand = Board::default().build(true);
+    let ebt = scan_blocks(&mut nand).unwrap();
+    let copies = &find_pebs(&ebt, Board::default().overlay_id)[&1];
+    let BlockContent::EcData(_, Some(newest)) = ebt[copies[0] as usize] else {
+        unreachable!()
+    };
+    rewrite_vid(&mut nand, copies[1], |vid| vid.sqnum = newest.sqnum);
+    assert_refused_like_reset(nand, "same sequence number");
+}
+
+#[test]
+fn test_refuse_invalid_vid_headers() {
+    let cases: [fn(&mut Vid); 5] = [
+        |vid| vid.compat = 5,
+        |vid| vid.data_size = 123,
+        |vid| vid.data_crc = 1,
+        |vid| vid.used_ebs = 1,
+        |vid| {
+            vid.copy_flag = true;
+            vid.data_size = LEB as u32 + 1;
+        },
+    ];
+    for modify in cases {
+        let mut nand = Board::default().build(true);
+        let peb = overlay_peb(&mut nand, 2);
+        rewrite_vid(&mut nand, peb, modify);
+        assert_refused_like_reset(nand, "VID header UBI would reject");
+    }
+}
+
+#[test]
+fn test_refuse_copy_flag_out_of_range() {
+    // copy_flag 2 is rejected by the kernel, and by our decoder: the PEB then scans as data
+    // without a usable VID header, which must not be silently dropped.
+    let mut nand = Board::default().build(true);
+    let peb = overlay_peb(&mut nand, 2);
+    rewrite_block(&mut nand, peb, |raw| {
+        let vid = &mut raw[LAYOUT.bytes_per_page..][..64];
+        vid[6] = 2;
+        let crc = crate::ubi::UBI_CRC.checksum(&vid[..60]);
+        vid[60..].copy_from_slice(&crc.to_be_bytes());
+    });
+    assert!(matches!(
+        scan_blocks(&mut nand).unwrap()[peb as usize],
+        BlockContent::EcData(_, None)
+    ));
+    assert_refused_like_reset(nand, "damaged UBI header");
+}
+
+#[test]
+fn test_refuse_erase_counter_out_of_range() {
+    let mut nand = Board::default().build(true);
+    let peb = overlay_peb(&mut nand, 0);
+    rewrite_block(&mut nand, peb, |raw| {
+        let ec = Ec::decode(raw).unwrap();
+        Ec {
+            ec: 0x8000_0000,
+            ..ec
+        }
+        .encode(raw)
+        .unwrap();
+    });
+    assert_refused_like_reset(nand, "unexpected UBI header");
+}
+
+#[test]
+fn test_refuse_corrupt_ec_header_on_kept_peb() {
+    // The kernel reads the VID header of a PEB whose EC header is damaged and uses the LEB; the
+    // scan here calls the PEB garbage and `format` would erase it.
+    let mut nand = Board::default().build(true);
+    let peb = overlay_peb(&mut nand, 3);
+    rewrite_block(&mut nand, peb, |raw| raw[10] ^= 0xFF);
+    assert_eq!(
+        scan_blocks(&mut nand).unwrap()[peb as usize],
+        BlockContent::Garbage
+    );
+    assert_refused_like_reset(nand, "damaged UBI header");
+}
+
+#[test]
+fn test_refuse_corrupt_ec_header_on_layout_peb() {
+    let mut nand = Board::default().build(true);
+    let ebt = scan_blocks(&mut nand).unwrap();
+    let peb = find_pebs(&ebt, LAYOUT_VOL_ID)[&1][0];
+    rewrite_block(&mut nand, peb, |raw| raw[10] ^= 0xFF);
+    assert_refused_like_reset(nand, "volume table");
+}
+
+#[test]
+fn test_refuse_huge_sqnum() {
+    let mut nand = Board::default().build(true);
+    let peb = overlay_peb(&mut nand, 4);
+    rewrite_vid(&mut nand, peb, |vid| vid.sqnum = 1 << 63);
+    assert_refused_like_reset(nand, "implausibly high");
+}
+
+/// A NAND that panics once armed, to stand in for a bug in discovery
+struct PanickyNand(SimNand, bool);
+
+impl crate::nand::Nand for PanickyNand {
+    type Block<'a> = <SimNand as crate::nand::Nand>::Block<'a>;
+
+    fn block(&mut self, index: u32) -> anyhow::Result<Option<Self::Block<'_>>> {
+        assert!(!self.1, "simulated bug");
+        self.0.block(index)
+    }
+
+    fn get_layout(&self) -> NandLayout {
+        self.0.get_layout()
+    }
+}
+
+#[test]
+fn test_panic_in_discovery_is_a_refusal() {
+    let mut nand = PanickyNand(Board::default().build(true), false);
+    let ebt = scan_blocks(&mut nand).unwrap();
+    nand.1 = true;
+    let rootfs = new_rootfs();
+    let mut image = &rootfs[..];
+    let volumes = installer_volumes(&mut image, rootfs.len() as u64);
+    let plan = plan(
+        &mut nand,
+        &ebt,
+        InstallMode::KeepSettings,
+        &volumes,
+        LAYOUT.blocks,
+    );
+    assert_eq!(
+        plan,
+        SettingsPlan::CannotKeep("internal error during discovery: simulated bug".into())
+    );
+}
+
+#[test]
+fn test_format_rechecks_the_plan() {
+    let mut nand = Board::default().build(true);
+    let mut ebt = scan_blocks(&mut nand).unwrap();
+    let mut preserved = find_preserved_volume(&mut nand, &ebt, SETTINGS_VOLUME).unwrap();
+    let before = dump(&mut nand);
+
+    // A prototype other than the one the flash gives
+    preserved.proto.image_seq ^= 1;
+    assert!(format(&mut nand, &mut ebt, Some(&preserved)).is_err());
+    preserved.proto.image_seq ^= 1;
+
+    // A kept PEB that is no longer what discovery saw
+    let peb = *preserved.pebs.first().unwrap();
+    let saved = ebt[peb as usize];
+    ebt[peb as usize] = BlockContent::Garbage;
+    assert!(format(&mut nand, &mut ebt, Some(&preserved)).is_err());
+    ebt[peb as usize] = saved;
+
+    // Nothing was erased
+    assert!(dump(&mut nand) == before);
+    assert!(format(&mut nand, &mut ebt, Some(&preserved)).is_ok());
+}
+
+#[test]
+fn test_duplicate_names_fail_before_writing() {
+    let mut nand = SimNand::new(LAYOUT);
+    let mut ebt = scan_blocks(&mut nand).unwrap();
+    format(&mut nand, &mut ebt, None).unwrap();
+    let before = dump(&mut nand);
+
+    let mut a = &[1u8; LEB][..];
+    let volumes: Vec<Box<dyn Volume + '_>> = vec![
+        Box::new(
+            BasicVolume::new(VolType::Dynamic)
+                .name("same")
+                .size(LEB as u64)
+                .image(&mut a),
+        ),
+        Box::new(BasicVolume::new(VolType::Dynamic).name("same")),
+    ];
+    assert!(write_volumes(&mut nand, &mut ebt, volumes).is_err());
+    assert!(dump(&mut nand) == before);
+}
+
+#[test]
+fn test_sqnum_exhaustion_is_an_error() {
+    let mut a = &[1u8; LEB][..];
+    let volumes: Vec<Box<dyn Volume + '_>> = vec![Box::new(
+        BasicVolume::new(VolType::Dynamic)
+            .name("a")
+            .size(LEB as u64)
+            .image(&mut a),
+    )];
+    let mut ubinizer = Ubinizer::new(volumes, (LEB as u32).try_into().unwrap())
+        .unwrap()
+        .sqnum_base(u64::MAX);
+    assert!(ubinizer.next_block(&mut Vec::new()).is_err());
+}
+
+#[test]
+fn test_factory_reset_cmdline() {
+    for cmdline in [
+        "factory_reset",
+        "console=ttyS0 factory_reset loglevel=4",
+        "factory_reset=1",
+        "factory_reset=y",
+        "factory_reset=YES",
+        "factory_reset=True",
+        "factory_reset=0 factory_reset",
+    ] {
+        assert!(factory_reset_requested(cmdline), "{cmdline:?}");
+    }
+    for cmdline in [
+        "",
+        "loglevel=4",
+        "nofactory_reset",
+        "factory_reset=0",
+        "factory_reset=n",
+        "factory_reset=No",
+        "factory_reset=FALSE",
+        "factory_reset=",
+        "factory_reset=maybe",
+        "factory_resets",
+        "FACTORY_RESET_please",
+        "factory_reset factory_reset=0",
+    ] {
+        assert!(!factory_reset_requested(cmdline), "{cmdline:?}");
+    }
 }

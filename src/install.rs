@@ -31,6 +31,35 @@ pub enum InstallMode {
     FactoryReset,
 }
 
+/// The kernel command-line parameter that asks for a factory reset.
+pub const FACTORY_RESET_PARAM: &str = "factory_reset";
+
+/// Does this kernel command line ask for a factory reset?
+///
+/// Accepted: the bare word `factory_reset`, or `factory_reset=` followed by `1`, `y`, `yes` or
+/// `true` (any case). `factory_reset=0|n|no|false`, any other value, and other words such as
+/// `nofactory_reset` do not ask for one. As with kernel parameters, the last occurrence wins.
+///
+/// U-Boot's `install.scr` is to append the bare word when the microSD card's first partition
+/// carries a `factory-reset.txt`; that change ships in the same firmware release as this one.
+pub fn factory_reset_requested(cmdline: &str) -> bool {
+    let mut requested = false;
+    for word in cmdline.split_whitespace() {
+        let (key, value) = match word.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (word, None),
+        };
+        if key != FACTORY_RESET_PARAM {
+            continue;
+        }
+        requested = match value.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("1" | "y" | "yes" | "true") => true,
+            Some(_) => false,
+        };
+    }
+    requested
+}
+
 /// What the installation will actually do with the settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsPlan {
@@ -96,6 +125,11 @@ pub fn installer_volumes<'a>(
 /// `ebt` must come straight from [ubi::scan_blocks]. `volumes` are the volumes about to be
 /// written (without the settings volume). `device_pebs` is the size of the whole flash chip in
 /// PEBs of the `ubi` partition's size, which UBI's bad-block reserve is computed from.
+///
+/// This never fails and never panics: discovery parses whatever is on flash, and the SD-card
+/// installer runs as PID 1, where a panic is a kernel panic before the user sees a prompt. So a
+/// panic during discovery, which would be a bug, is caught and turned into a refusal, and the
+/// board gets the factory reset it always got.
 pub fn plan<N: Nand>(
     nand: &mut N,
     ebt: &Ebt,
@@ -107,6 +141,27 @@ pub fn plan<N: Nand>(
         return SettingsPlan::Reset;
     }
 
+    let discover = std::panic::AssertUnwindSafe(|| discover(nand, ebt, volumes, device_pebs));
+    match std::panic::catch_unwind(discover) {
+        Ok(plan) => plan,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|x| x.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            SettingsPlan::CannotKeep(format!("internal error during discovery: {message}"))
+        }
+    }
+}
+
+/// The part of [plan] that looks at the flash.
+fn discover<N: Nand>(
+    nand: &mut N,
+    ebt: &Ebt,
+    volumes: &[Box<dyn Volume + '_>],
+    device_pebs: u32,
+) -> SettingsPlan {
     let preserved = match find_preserved_volume(nand, ebt, SETTINGS_VOLUME) {
         Ok(preserved) => preserved,
         Err(refusal) => return SettingsPlan::CannotKeep(refusal.0),
@@ -136,8 +191,8 @@ pub fn plan<N: Nand>(
 /// Erase the `ubi` partition, except the settings volume's PEBs if the plan keeps them.
 pub fn format_ubi<N: Nand>(nand: &mut N, ebt: &mut Ebt, plan: &SettingsPlan) -> anyhow::Result<()> {
     match plan {
-        SettingsPlan::Keep(preserved) => ubi::format(nand, ebt, &preserved.pebs),
-        _ => ubi::format(nand, ebt, &Default::default()),
+        SettingsPlan::Keep(preserved) => ubi::format(nand, ebt, Some(preserved)),
+        _ => ubi::format(nand, ebt, None),
     }
 }
 
