@@ -55,18 +55,14 @@ jobs:
             exit 1
           fi
           sudo apt-get install -y mtd-utils erofs-utils "linux-modules-extra-$(uname -r)"
-      - name: TEMP modprobe probe
+      - name: Check that nandsim is loadable
         run: |
-          ls -l /dev/kvm || true
-          grep -c vmx /proc/cpuinfo || true
-          ver=$(apt-cache depends linux-image-generic | awk '/Depends: linux-image-[0-9]/{print $2}' | head -1)
-          echo "generic image: $ver"
-          kv=${ver#linux-image-}
-          mkdir -p /tmp/k && cd /tmp/k
-          apt-get download "linux-modules-$kv" "linux-modules-extra-$kv" || true
-          for f in *.deb; do echo "== $f"; dpkg -c "$f" | grep -i -E "nandsim|mtdram|block2mtd|/ubi/" | head; done
-          apt-cache search "^linux-image-.*(virtual|kvm|lowlatency)" | head
-          apt-cache search virtme qemu-system-x86 | head -3
+          if ! sudo modprobe nandsim first_id_byte=0x20 second_id_byte=0xaa third_id_byte=0x00 fourth_id_byte=0x15; then
+            echo "::error::the runner kernel $(uname -r) has no nandsim module (CONFIG_MTD is not set in the azure kernel)"
+            exit 1
+          fi
+          cat /proc/mtd
+          sudo rmmod nandsim
       - run: cargo build --release --bin install_on_mtd
       - run: sudo tests/nandsim.sh target/release/install_on_mtd
 
