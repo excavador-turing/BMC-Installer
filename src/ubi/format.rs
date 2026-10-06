@@ -6,7 +6,8 @@ use super::ubinize::{Ubinizer, Volume};
 
 use crate::nand::{Nand, NandBlock, NandLayout, PageUtil};
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::num::NonZeroU32;
 
 /// These are the actions that may be taken on each block to migrate away from SIMULATE_MULTIPLANE;
 /// this type implements the "command pattern"
@@ -124,9 +125,15 @@ fn migrate_superblock_action(
     [even_action, odd_action]
 }
 
+/// The LEB size the installer formats for: the full block, minus the first 2 pages (EC and VID).
+pub fn leb_size(layout: NandLayout) -> NonZeroU32 {
+    let eb_size = layout.bytes_per_page as u32 * (layout.pages_per_block - 2);
+    eb_size.try_into().expect("LEB size must be nonzero")
+}
+
 /// Figure out the "prototype" EC header. That is, the header that should be written to every PEB
 /// in the UBI partition.
-fn compute_prototype(
+pub(super) fn compute_prototype(
     layout: NandLayout,
     blocks: impl Iterator<Item = BlockContent>,
 ) -> anyhow::Result<Ec> {
@@ -174,13 +181,21 @@ fn compute_prototype(
 /// Reformat the UBI partition, performing AWNAND `SIMULATE_MULTIPLANE` migration (if deemed
 /// necessary), otherwise do regular UBI erase.
 ///
+/// The PEBs listed in `keep` are left exactly as they are (see [super::find_preserved_volume]);
+/// pass an empty set to erase everything. Keeping PEBs is refused when migration is needed,
+/// because migration rewrites the geometry under them.
+///
 /// This does not write the layout volume, so it is not sufficient for UBI to accept the partition.
-pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt) -> anyhow::Result<()> {
+pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt, keep: &BTreeSet<u32>) -> anyhow::Result<()> {
     let rpt = howudoin::new().label("Erasing blocks");
 
     let proto = compute_prototype(nand.get_layout(), ebt.iter().copied())?;
 
     let needs_migration = ebt.iter().any(|x| matches!(x, BlockContent::RawVid(_)));
+    anyhow::ensure!(
+        keep.is_empty() || !needs_migration,
+        "cannot keep any blocks while migrating away from SIMULATE_MULTIPLANE",
+    );
     let work: VecDeque<(u32, FormatAction)> = if needs_migration {
         rpt.add_info("AWNAND SIMULATE_MULTIPLANE layout detected, performing migration");
 
@@ -211,7 +226,10 @@ pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt) -> anyhow::Result<()> {
         // Migration not needed, just do a regular erase
         ebt.iter()
             .enumerate()
-            .map(|(i, s)| (i as u32, erase_action(*s, proto)))
+            .map(|(i, s)| match keep.contains(&(i as u32)) {
+                true => (i as u32, FormatAction::Ignore),
+                false => (i as u32, erase_action(*s, proto)),
+            })
             .filter(|&(_, action)| action != FormatAction::Ignore)
             .collect()
     };
@@ -236,6 +254,9 @@ pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt) -> anyhow::Result<()> {
 }
 
 /// Use the `ubinize` module to write UBI volumes to the flash device.
+///
+/// Any PEB still holding data in `ebt` (that is, kept by [format]) is left alone, and the new VID
+/// headers are numbered above the highest sqnum found in them.
 pub fn write_volumes<'a, N, V>(nand: &mut N, ebt: &mut Ebt, volumes: V) -> anyhow::Result<()>
 where
     N: Nand,
@@ -244,8 +265,17 @@ where
 {
     // Compute the EB size. This is the full block size, minus the first 2 pages (for EC and VID).
     let layout = nand.get_layout();
-    let eb_size = layout.bytes_per_page as u32 * (layout.pages_per_block - 2);
-    let eb_size = eb_size.try_into().expect("LEB size must be nonzero");
+    let eb_size = leb_size(layout);
+
+    // The highest sqnum among the PEBs that stay on flash.
+    let max_kept_sqnum = ebt
+        .iter()
+        .filter_map(|content| match content {
+            BlockContent::EcData(_, Some(vid)) => Some(vid.sqnum),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
 
     // Estimate the needed blocks to complete the flashing operation.
     let blocks = Ubinizer::estimate_blocks((&volumes).into_iter().map(|x| &**x), eb_size);
@@ -285,7 +315,7 @@ where
     .flatten();
 
     // Begin ubinizing volumes
-    let mut ubinizer = Ubinizer::new(volumes, eb_size);
+    let mut ubinizer = Ubinizer::new(volumes, eb_size)?.sqnum_base(max_kept_sqnum);
     let vid_size = layout.bytes_per_page;
     let mut data = Vec::with_capacity(u32::from(eb_size) as usize + vid_size);
     data.resize(vid_size, 0u8);
@@ -393,7 +423,7 @@ mod test {
         let mut nand = SimNand::new(TEST_LAYOUT);
 
         let mut ebt = scan_blocks(&mut nand)?;
-        format(&mut nand, &mut ebt)?;
+        format(&mut nand, &mut ebt, &Default::default())?;
 
         // Make sure `format` updated `ebt`:
         let ebt2 = scan_blocks(&mut nand)?;

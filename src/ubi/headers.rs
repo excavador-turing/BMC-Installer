@@ -395,6 +395,29 @@ impl VolTableRecord {
         vtblrec.try_into().ok()
     }
 
+    /// Decode one slot of an on-flash volume table, telling an empty slot apart from a corrupt one.
+    ///
+    /// [VolTableRecord::decode] cannot do this: an empty slot is a valid record (correct CRC) with
+    /// a zero `vol_type`, which does not convert into a [VolType]. The kernel treats any slot with
+    /// `reserved_pebs == 0` as empty (see `init_volumes` in drivers/mtd/ubi/vtbl.c).
+    ///
+    /// A slot that does not parse or fails its CRC check is [VtblSlot::Corrupt].
+    pub fn decode_slot(bytes: &[u8]) -> VtblSlot {
+        let Ok((_, vtblrec)) = VtblRecord::from_bytes((bytes, 0)) else {
+            return VtblSlot::Corrupt;
+        };
+        if !vtblrec.check_crc() {
+            return VtblSlot::Corrupt;
+        }
+        if vtblrec.reserved_pebs == 0 {
+            return VtblSlot::Empty;
+        }
+        match vtblrec.try_into() {
+            Ok(record) => VtblSlot::Volume(record),
+            Err(()) => VtblSlot::Corrupt,
+        }
+    }
+
     /// Write into a Vec<u8>
     pub fn into_bytes(self) -> Vec<u8> {
         VtblRecord::from(self).to_bytes().unwrap()
@@ -417,6 +440,19 @@ impl VolTableRecord {
         record.fix_crc();
         record.to_bytes().unwrap()
     }
+}
+
+/// The content of one slot of an on-flash volume table, see [VolTableRecord::decode_slot]
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum VtblSlot {
+    /// No volume uses this ID
+    Empty,
+
+    /// The volume with this ID
+    Volume(VolTableRecord),
+
+    /// The slot cannot be trusted
+    Corrupt,
 }
 
 pub trait OptionIntoBytes {
