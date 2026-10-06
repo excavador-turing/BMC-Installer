@@ -1,12 +1,13 @@
 //! This module implements the reformatting/erasing logic.
 
-use super::headers::Ec;
+use super::headers::{Ec, UBI_MAX_ERASECOUNTER};
+use super::preserve::Preserved;
 use super::scan::{BlockContent, Ebt};
 use super::ubinize::{Ubinizer, Volume};
 
 use crate::nand::{Nand, NandBlock, NandLayout, PageUtil};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroU32;
 
 /// These are the actions that may be taken on each block to migrate away from SIMULATE_MULTIPLANE;
@@ -75,7 +76,8 @@ fn erase_action(content: BlockContent, ec_proto: Ec) -> FormatAction {
         Bad => Ignore,
 
         // We can ignore any empty blocks with ECs that already match the prototype's layout fields
-        EcErased(x) if x == ec_proto.ec(x.ec) => Ignore,
+        // (and that UBI will accept: an erase counter out of range fails the whole attach)
+        EcErased(x) if x == ec_proto.ec(x.ec) && x.ec <= UBI_MAX_ERASECOUNTER => Ignore,
 
         // Otherwise, we have to do something.
 
@@ -84,7 +86,7 @@ fn erase_action(content: BlockContent, ec_proto: Ec) -> FormatAction {
 
         // If we know the EC, erase and use that. Otherwise, just use the prototypical EC, which
         // holds the mean erase count.
-        EcData(x, _) | EcErased(x) => Erase(ec_proto.ec(x.ec + 1)),
+        EcData(x, _) | EcErased(x) => Erase(ec_proto.ec(x.ec).inc_ec()),
         RawVid(_) | Garbage => Erase(ec_proto),
     }
 }
@@ -110,12 +112,12 @@ fn migrate_superblock_action(
         (_, Bad) => Ignore,
 
         // If there's already an EC in the odd block, no special even-block analysis is required
-        (_, EcErased(x)) if x == ec_proto.ec(x.ec) => Ignore,
-        (_, EcErased(x) | EcData(x, _)) => Erase(ec_proto.ec(x.ec + 1)),
+        (_, EcErased(x)) if x == ec_proto.ec(x.ec) && x.ec <= UBI_MAX_ERASECOUNTER => Ignore,
+        (_, EcErased(x) | EcData(x, _)) => Erase(ec_proto.ec(x.ec).inc_ec()),
 
         // Copy superblock EC (from even physical block) to odd block
-        (EcErased(x) | EcData(x, _), Erased) => Write(ec_proto.ec(x.ec)),
-        (EcErased(x) | EcData(x, _), RawVid(_) | Garbage) => Erase(ec_proto.ec(x.ec + 1)),
+        (EcErased(x) | EcData(x, _), Erased) => Write(ec_proto.ec(x.ec.min(UBI_MAX_ERASECOUNTER))),
+        (EcErased(x) | EcData(x, _), RawVid(_) | Garbage) => Erase(ec_proto.ec(x.ec).inc_ec()),
 
         // When the superblock EC cannot be copied, just use the prototypical EC header:
         (_, Erased) => Write(ec_proto),
@@ -133,6 +135,10 @@ pub fn leb_size(layout: NandLayout) -> NonZeroU32 {
 
 /// Figure out the "prototype" EC header. That is, the header that should be written to every PEB
 /// in the UBI partition.
+///
+/// The image_seq is the most common one (ties go to the lowest value, so that the result does not
+/// depend on hash order), and the erase counter is the mean, clamped to what UBI accepts. Every
+/// value comes from flash, so nothing here may overflow.
 pub(super) fn compute_prototype(
     layout: NandLayout,
     blocks: impl Iterator<Item = BlockContent>,
@@ -143,8 +149,8 @@ pub(super) fn compute_prototype(
     let mut image_seq_ctrs = HashMap::new();
 
     // Find the mean EC value
-    let mut ec_sum = 0;
-    let mut ec_count = 0;
+    let mut ec_sum: u128 = 0;
+    let mut ec_count: u128 = 0;
 
     for content in blocks {
         let echdr = match content {
@@ -154,20 +160,21 @@ pub(super) fn compute_prototype(
         };
 
         // Add a tally to the number of times `echdr.image_seq` is seen
-        *image_seq_ctrs.entry(echdr.image_seq).or_insert(0) += 1;
+        *image_seq_ctrs.entry(echdr.image_seq).or_insert(0u64) += 1;
 
-        ec_sum += echdr.ec;
+        ec_sum += u128::from(echdr.ec);
         ec_count += 1;
     }
 
     // Determine the mode of `echdr.image_seq`
     let image_seq = image_seq_ctrs
         .into_iter()
-        .max_by_key(|&(_, v)| v) // find entry with most hits
+        .max_by_key(|&(k, v)| (v, std::cmp::Reverse(k))) // most hits, then lowest value
         .map_or(0, |(k, _)| k); // get only the key (or 0 if the HashMap is empty)
 
     // Compute mean EC value, rounded to nearest integer, or 1 if ec_count == 0
     let ec = (ec_sum + ec_count / 2).checked_div(ec_count).unwrap_or(1);
+    let ec = ec.min(u128::from(UBI_MAX_ERASECOUNTER)) as u64;
 
     Ok(Ec {
         vid_hdr_offset: page_size,
@@ -181,19 +188,43 @@ pub(super) fn compute_prototype(
 /// Reformat the UBI partition, performing AWNAND `SIMULATE_MULTIPLANE` migration (if deemed
 /// necessary), otherwise do regular UBI erase.
 ///
-/// The PEBs listed in `keep` are left exactly as they are (see [super::find_preserved_volume]);
-/// pass an empty set to erase everything. Keeping PEBs is refused when migration is needed,
-/// because migration rewrites the geometry under them.
+/// The PEBs of `keep` are left exactly as they are (see [super::find_preserved_volume]); pass
+/// `None` to erase everything. When keeping, the prototype EC header is the one discovery checked
+/// the kept PEBs against, and this re-checks, before erasing anything, that it still is what the
+/// flash gives and that every kept PEB still matches it. Keeping PEBs is refused when migration is
+/// needed, because migration rewrites the geometry under them.
 ///
 /// This does not write the layout volume, so it is not sufficient for UBI to accept the partition.
-pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt, keep: &BTreeSet<u32>) -> anyhow::Result<()> {
+pub fn format<N: Nand>(
+    nand: &mut N,
+    ebt: &mut Ebt,
+    keep: Option<&Preserved>,
+) -> anyhow::Result<()> {
     let rpt = howudoin::new().label("Erasing blocks");
 
     let proto = compute_prototype(nand.get_layout(), ebt.iter().copied())?;
+    let empty = Default::default();
+    let keep_pebs = match keep {
+        None => &empty,
+        Some(preserved) => {
+            anyhow::ensure!(
+                preserved.proto == proto,
+                "the flash changed since it was analyzed (UBI header prototype differs)",
+            );
+            for &peb in &preserved.pebs {
+                let matches = match ebt.get(peb as usize) {
+                    Some(BlockContent::EcData(ec, Some(_))) => *ec == proto.ec(ec.ec),
+                    _ => false,
+                };
+                anyhow::ensure!(matches, "kept PEB {peb} changed since it was analyzed");
+            }
+            &preserved.pebs
+        }
+    };
 
     let needs_migration = ebt.iter().any(|x| matches!(x, BlockContent::RawVid(_)));
     anyhow::ensure!(
-        keep.is_empty() || !needs_migration,
+        keep_pebs.is_empty() || !needs_migration,
         "cannot keep any blocks while migrating away from SIMULATE_MULTIPLANE",
     );
     let work: VecDeque<(u32, FormatAction)> = if needs_migration {
@@ -201,9 +232,10 @@ pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt, keep: &BTreeSet<u32>) -> any
 
         let mut work = VecDeque::new();
         for (i, action) in ebt
-            .chunks_exact(2)
-            .map(|x| TryInto::<[BlockContent; 2]>::try_into(x).unwrap())
-            .flat_map(|[even, odd]| migrate_superblock_action(even, odd, proto))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[even, odd]| migrate_superblock_action(even, odd, proto))
             .enumerate()
             .filter(|&(_, action)| action != FormatAction::Ignore)
         {
@@ -226,7 +258,7 @@ pub fn format<N: Nand>(nand: &mut N, ebt: &mut Ebt, keep: &BTreeSet<u32>) -> any
         // Migration not needed, just do a regular erase
         ebt.iter()
             .enumerate()
-            .map(|(i, s)| match keep.contains(&(i as u32)) {
+            .map(|(i, s)| match keep_pebs.contains(&(i as u32)) {
                 true => (i as u32, FormatAction::Ignore),
                 false => (i as u32, erase_action(*s, proto)),
             })
@@ -410,7 +442,7 @@ mod test {
     use super::*;
 
     use super::super::scan_blocks;
-    use crate::nand::{NandLayout, SimNand};
+    use crate::nand::{NandBlock, NandLayout, SimNand};
 
     const TEST_LAYOUT: NandLayout = NandLayout {
         blocks: 16,
@@ -423,11 +455,66 @@ mod test {
         let mut nand = SimNand::new(TEST_LAYOUT);
 
         let mut ebt = scan_blocks(&mut nand)?;
-        format(&mut nand, &mut ebt, &Default::default())?;
+        format(&mut nand, &mut ebt, None)?;
 
         // Make sure `format` updated `ebt`:
         let ebt2 = scan_blocks(&mut nand)?;
         assert_eq!(ebt, ebt2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prototype_survives_any_flash() {
+        let ec = |ec: u64, image_seq: u32| {
+            BlockContent::EcErased(Ec {
+                ec,
+                image_seq,
+                ..Default::default()
+            })
+        };
+
+        // Erase counters that would overflow a u64 sum: the mean is clamped, nothing panics.
+        let blocks = [ec(u64::MAX, 7), ec(u64::MAX, 7), ec(u64::MAX - 1, 7)];
+        let proto = compute_prototype(TEST_LAYOUT, blocks.into_iter()).unwrap();
+        assert_eq!(proto.ec, UBI_MAX_ERASECOUNTER);
+        assert_eq!(proto.image_seq, 7);
+
+        // A tie between image_seqs goes to the lowest, whatever the hash order.
+        for _ in 0..16 {
+            let blocks = [ec(1, 9), ec(1, 3), ec(1, 9), ec(1, 3), ec(1, 5)];
+            let proto = compute_prototype(TEST_LAYOUT, blocks.into_iter()).unwrap();
+            assert_eq!(proto.image_seq, 3);
+        }
+    }
+
+    #[test]
+    fn test_format_clamps_erase_counters() -> anyhow::Result<()> {
+        let mut nand = SimNand::new(TEST_LAYOUT);
+        let mut buf = vec![0xFFu8; TEST_LAYOUT.bytes_per_page];
+        for (i, value) in [u64::MAX, UBI_MAX_ERASECOUNTER + 1, UBI_MAX_ERASECOUNTER]
+            .into_iter()
+            .enumerate()
+        {
+            let page = TEST_LAYOUT.bytes_per_page as u32;
+            Ec {
+                ec: value,
+                vid_hdr_offset: page,
+                data_offset: 2 * page,
+                image_seq: 0,
+            }
+            .encode(&mut buf)?;
+            nand.block(i as u32)?.unwrap().program(0, &buf)?;
+        }
+
+        let mut ebt = scan_blocks(&mut nand)?;
+        format(&mut nand, &mut ebt, None)?;
+        for content in scan_blocks(&mut nand)?.iter() {
+            match content {
+                BlockContent::EcErased(ec) => assert!(ec.ec <= UBI_MAX_ERASECOUNTER),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
 
         Ok(())
     }

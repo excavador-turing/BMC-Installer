@@ -66,22 +66,15 @@ pub fn wait_forever() -> ! {
     }
 }
 
-/// The kernel command-line word that asks for a factory reset. U-Boot adds it when the microSD
-/// card carries a `factory-reset.txt`.
-const FACTORY_RESET_CMDLINE: &str = "factory_reset";
-
 /// Determine the [InstallMode] asked for on the kernel command line: [InstallMode::FactoryReset]
-/// if it contains the word `factory_reset`, otherwise [InstallMode::KeepSettings].
+/// if it asks for one (see [install::factory_reset_requested]), otherwise
+/// [InstallMode::KeepSettings].
 ///
 /// `/proc` must be mounted (see [setup_initramfs]). If the command line cannot be read, settings
 /// are kept when possible, as they would be with no request at all.
 pub fn install_mode_from_cmdline() -> InstallMode {
     let requested = fs::read_to_string("/proc/cmdline")
-        .map(|cmdline| {
-            cmdline
-                .split_whitespace()
-                .any(|word| word == FACTORY_RESET_CMDLINE)
-        })
+        .map(|cmdline| install::factory_reset_requested(&cmdline))
         .unwrap_or(false);
 
     match requested {

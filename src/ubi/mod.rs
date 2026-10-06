@@ -43,6 +43,6 @@ mod scan;
 pub mod ubinize;
 
 pub use format::{format, leb_size, write_volumes};
-pub use headers::{Ec, Vid, VolTableRecord, VolType, VtblSlot};
+pub use headers::{Ec, Vid, VolTableRecord, VolType, VtblSlot, UBI_CRC};
 pub use preserve::{check_capacity, find_preserved_volume, Preserved, Refusal};
 pub use scan::{scan_blocks, BlockContent, Ebt};
